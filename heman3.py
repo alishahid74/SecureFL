@@ -1,1216 +1,1098 @@
-import numpy as np
+"""
+Secure Graph-Based Federated Learning Framework
+================================================
+A comprehensive framework combining:
+- Graph-based FL topology for neighbor-aware aggregation
+- Multi-KRUM Byzantine-fault-tolerant selection
+- Adaptive Trust Algorithm (ATA)
+- Trust-Aware Differential Privacy
+- Homomorphic Encryption (Paillier)
+- Secure Aggregation
+- Attack simulations (Poison, Backdoor, Inference, Model Inversion)
+
+Supports both CNN (for MNIST) and simple logistic regression models.
+"""
+
+import time
 import random
-import os
-import pandas as pd
-from typing import List, Dict, Tuple, Optional
-import copy
+import warnings
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Callable
 from collections import defaultdict
-from pathlib import Path
+from abc import ABC, abstractmethod
+
+import numpy as np
+import networkx as nx
 import matplotlib.pyplot as plt
 import seaborn as sns
-from matplotlib.ticker import MaxNLocator
-from scipy import signal
-import neurokit2 as nk
-from sklearn.preprocessing import StandardScaler
-import phe as paillier
-from sklearn.metrics import accuracy_score
 
-# Differential Privacy parameters
-DEFAULT_EPSILON = 1.0
-DEFAULT_DELTA = 1e-5
-DEFAULT_SENSITIVITY = 1.0
+# PyTorch imports
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 
-# =====================
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# Optional imports with graceful fallback
+try:
+    from torchvision import datasets, transforms
+    TORCHVISION_AVAILABLE = True
+except ImportError:
+    TORCHVISION_AVAILABLE = False
+    print("Warning: torchvision not available. CNN/MNIST features disabled.")
+
+try:
+    from opacus import PrivacyEngine
+    OPACUS_AVAILABLE = True
+except ImportError:
+    OPACUS_AVAILABLE = False
+    print("Warning: Opacus not available. DP with PyTorch disabled.")
+
+try:
+    import phe as paillier
+    PAILLIER_AVAILABLE = True
+except ImportError:
+    PAILLIER_AVAILABLE = False
+    print("Warning: phe not available. Homomorphic encryption disabled.")
+
+
+# =============================================================================
+# CONFIGURATION & ENUMS
+# =============================================================================
+
+class AttackType(Enum):
+    NONE = "none"
+    POISON = "poison"
+    BACKDOOR = "backdoor"
+    INFERENCE = "inference"
+    MODEL_INVERSION = "model_inversion"
+
+
+class SelectionMethod(Enum):
+    RANDOM = "random"
+    MULTI_KRUM = "multi_krum"
+    TRUST_BASED = "trust_based"
+
+
+class AggregationMethod(Enum):
+    FEDAVG = "fedavg"
+    GRAPH_WEIGHTED = "graph_weighted"
+    TRUST_WEIGHTED = "trust_weighted"
+
+
+@dataclass
+class FLConfig:
+    """Configuration for Federated Learning experiments."""
+    # Client settings
+    num_clients: int = 10
+    malicious_ratio: float = 0.2
+    selection_fraction: float = 0.6
+    min_clients_per_round: int = 3
+    
+    # Training settings
+    num_rounds: int = 10
+    local_epochs: int = 3
+    learning_rate: float = 0.01
+    batch_size: int = 32
+    
+    # Privacy settings
+    use_dp: bool = True
+    dp_epsilon: float = 1.0
+    dp_delta: float = 1e-5
+    dp_max_grad_norm: float = 1.0
+    noise_multiplier: float = 1.1
+    
+    # Security settings
+    use_homomorphic_encryption: bool = False
+    use_secure_aggregation: bool = False
+    
+    # Graph settings
+    use_graph_topology: bool = True
+    graph_connection_prob: float = 0.6
+    
+    # Defense settings
+    selection_method: SelectionMethod = SelectionMethod.MULTI_KRUM
+    aggregation_method: AggregationMethod = AggregationMethod.TRUST_WEIGHTED
+    enable_hierarchical_defense: bool = True
+    
+    # Attack settings (for simulation)
+    attack_types: List[AttackType] = field(default_factory=lambda: [
+        AttackType.POISON, AttackType.BACKDOOR
+    ])
+
+
+# =============================================================================
+# NEURAL NETWORK MODELS
+# =============================================================================
+
+class CNN(nn.Module):
+    """Simple CNN for MNIST classification."""
+    
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+
+class SimpleMLP(nn.Module):
+    """Simple MLP for tabular data."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 64, num_classes: int = 2):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+# =============================================================================
 # ATTACK IMPLEMENTATIONS
-# =====================
+# =============================================================================
 
-class AttackMethods:
+class AttackSimulator:
+    """Simulates various adversarial attacks in federated learning."""
+    
     @staticmethod
-    def poison_injection(client, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Label flipping attack - flip labels of a portion of data"""
-        if not client.is_malicious:
-            return X, y
-            
-        poison_ratio = 0.8  # Percentage of data to poison
+    def poison_labels(y: np.ndarray, poison_ratio: float = 0.8) -> np.ndarray:
+        """Label flipping attack - flip labels of a portion of data."""
+        y_poisoned = y.copy()
         n_poison = int(len(y) * poison_ratio)
         poison_indices = np.random.choice(len(y), n_poison, replace=False)
         
-        y_poisoned = y.copy()
-        y_poisoned[poison_indices] = 1 - y_poisoned[poison_indices]  # Flip labels
+        # For binary: flip, for multi-class: random reassign
+        if len(np.unique(y)) == 2:
+            y_poisoned[poison_indices] = 1 - y_poisoned[poison_indices]
+        else:
+            num_classes = len(np.unique(y))
+            y_poisoned[poison_indices] = np.random.randint(0, num_classes, n_poison)
         
-        print(f"Client {client.client_id}: Poisoned {n_poison} samples")
-        return X, y_poisoned
-
+        return y_poisoned
+    
     @staticmethod
-    def backdoor_attack(client, X: np.ndarray) -> np.ndarray:
-        """Add backdoor pattern to features"""
-        if not client.is_malicious:
-            return X
-            
-        backdoor_ratio = 0.4  # Percentage of data to add backdoor
+    def add_backdoor_pattern(
+        X: np.ndarray, 
+        backdoor_ratio: float = 0.4,
+        pattern_strength: float = 2.0
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Add backdoor trigger pattern to features."""
+        X_backdoor = X.copy()
         n_backdoor = int(len(X) * backdoor_ratio)
         backdoor_indices = np.random.choice(len(X), n_backdoor, replace=False)
         
-        # Create backdoor pattern (specific feature perturbation)
-        pattern = np.zeros(X.shape[1])
-        pattern[:3] = 2.0  # Modify first three features
+        # Create pattern (modify first few features)
+        pattern = np.zeros(X.shape[1] if len(X.shape) > 1 else 1)
+        pattern_size = min(3, len(pattern))
+        pattern[:pattern_size] = pattern_strength
         
-        X_backdoor = X.copy()
-        X_backdoor[backdoor_indices] += pattern
+        if len(X.shape) > 1:
+            X_backdoor[backdoor_indices] += pattern
         
-        print(f"Client {client.client_id}: Added backdoor to {n_backdoor} samples")
-        return X_backdoor
-
+        return X_backdoor, backdoor_indices
+    
     @staticmethod
-    def inference_attack(server, client):
-        """Attempt to reconstruct global model parameters"""
-        if not client.is_malicious:
-            return 0.0
-            
-        # Simple reconstruction attempt
-        reconstructed_model = server.global_model + np.random.normal(
-            scale=0.1, size=server.global_model.shape
+    def inference_attack(
+        global_model: np.ndarray, 
+        noise_scale: float = 0.1
+    ) -> Tuple[np.ndarray, float]:
+        """Attempt to reconstruct global model parameters."""
+        reconstructed = global_model + np.random.normal(
+            scale=noise_scale, size=global_model.shape
         )
-        
-        # Calculate reconstruction error
-        error = np.linalg.norm(server.global_model - reconstructed_model)
-        print(f"Client {client.client_id}: Inference attack error: {error:.4f}")
-        return error
-
+        error = np.linalg.norm(global_model - reconstructed)
+        return reconstructed, error
+    
     @staticmethod
-    def model_inversion(client, global_model: np.ndarray) -> np.ndarray:
-        """Attempt to reconstruct training data from model"""
-        if not client.is_malicious:
-            return np.zeros(client.X.shape[1])
-            
-        # Simplified inversion - generate data that maximizes prediction
+    def model_inversion(
+        global_model: np.ndarray,
+        n_candidates: int = 100
+    ) -> np.ndarray:
+        """Attempt to reconstruct training data from model."""
+        if len(global_model) < 2:
+            return np.zeros(1)
+        
         w = global_model[:-1]
         b = global_model[-1]
         
-        # Generate random candidate samples
-        candidates = np.random.randn(100, len(w))
-        
-        # Find sample that maximizes output
+        # Generate candidate samples
+        candidates = np.random.randn(n_candidates, len(w))
         outputs = candidates.dot(w) + b
-        inverted_sample = candidates[np.argmax(outputs)]
         
-        print(f"Client {client.client_id}: Model inversion attempted")
-        return inverted_sample
+        # Return sample that maximizes output
+        return candidates[np.argmax(outputs)]
 
-# =====================
-# CLIENT CLASS
-# =====================
 
-class Client:
-    def __init__(self, client_id: int, X: np.ndarray, y: np.ndarray, 
-                 is_malicious: bool = False, compute_capacity: float = 1.0, 
-                 network_speed: float = 1.0, attack_type: str = None):
+# =============================================================================
+# FEDERATED LEARNING CLIENT
+# =============================================================================
+
+class FLClient:
+    """Federated Learning client with attack/defense capabilities."""
+    
+    def __init__(
+        self,
+        client_id: int,
+        dataset: Dataset,
+        config: FLConfig,
+        is_malicious: bool = False,
+        attack_type: AttackType = AttackType.NONE,
+        compute_capacity: float = 1.0,
+        network_speed: float = 1.0,
+    ):
         self.client_id = client_id
-        self.X = X  # Feature matrix
-        self.y = y  # Labels
-        self.data_size = len(X)
-        self.model = None
-        self.trust_score = 1.0
+        self.dataset = dataset
+        self.config = config
         self.is_malicious = is_malicious
-        self.history = []
+        self.attack_type = attack_type
         self.compute_capacity = compute_capacity
         self.network_speed = network_speed
-        self.participation_count = 0
-        self.attack_type = attack_type
-        self.attack_success = 0.0
-
-    def apply_attack(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Apply attack on data during local training"""
-        if not self.is_malicious or self.attack_type is None:
-            return X, y
-            
-        if self.attack_type == "poison":
-            return AttackMethods.poison_injection(self, X, y)
-        elif self.attack_type == "backdoor":
-            X_attacked = AttackMethods.backdoor_attack(self, X)
-            # Set labels of backdoored samples to 1 (target class)
-            n_backdoor = int(len(X) * 0.4)
-            y_attacked = y.copy()
-            y_attacked[:n_backdoor] = 1  # First n_backdoor samples
-            return X_attacked, y_attacked
-        return X, y  # No attack applied
         
-    def secure_mask_update(self, update: np.ndarray, public_keys: list) -> np.ndarray:
-        """Apply secure aggregation masking"""
+        # Trust and history tracking
+        self.trust_score = 1.0
+        self.update_history: List[np.ndarray] = []
+        self.participation_count = 0
+        
+        # Graph neighbors (set by server)
+        self.neighbors: List[int] = []
+        
+        # Model and training components
+        self.model: Optional[nn.Module] = None
+        self.optimizer: Optional[optim.Optimizer] = None
+        self.train_loader: Optional[DataLoader] = None
+        
+        # Initialize data loader
+        self._setup_data_loader()
+    
+    def _setup_data_loader(self):
+        """Setup the training data loader."""
+        self.train_loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            drop_last=True if len(self.dataset) > self.config.batch_size else False
+        )
+    
+    def setup_model(self, model: nn.Module):
+        """Initialize client's local model."""
+        self.model = model
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            momentum=0.9
+        )
+    
+    def _apply_attack_to_batch(
+        self, 
+        data: torch.Tensor, 
+        targets: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply attack transformations to a training batch."""
+        if not self.is_malicious or self.attack_type == AttackType.NONE:
+            return data, targets
+        
+        if self.attack_type == AttackType.POISON:
+            # Label flipping
+            targets_np = targets.cpu().numpy()
+            targets_poisoned = AttackSimulator.poison_labels(targets_np, poison_ratio=0.5)
+            return data, torch.tensor(targets_poisoned, dtype=targets.dtype, device=targets.device)
+        
+        elif self.attack_type == AttackType.BACKDOOR:
+            # Add backdoor pattern to images
+            data_np = data.cpu().numpy()
+            # Simple pattern: bright pixel in corner
+            data_np[:, :, 0, 0] = 1.0
+            data_np[:, :, 0, 1] = 1.0
+            data_np[:, :, 1, 0] = 1.0
+            return torch.tensor(data_np, dtype=data.dtype, device=data.device), targets
+        
+        return data, targets
+    
+    def train_local(
+        self, 
+        global_state_dict: Dict,
+        device: torch.device = torch.device('cpu')
+    ) -> Dict:
+        """Perform local training and return model update."""
+        if self.model is None:
+            raise ValueError("Model not initialized. Call setup_model first.")
+        
+        # Load global model weights
+        self.model.load_state_dict(global_state_dict)
+        self.model.to(device)
+        self.model.train()
+        
+        criterion = nn.CrossEntropyLoss()
+        
+        for epoch in range(self.config.local_epochs):
+            for data, targets in self.train_loader:
+                # Apply attack if malicious
+                data, targets = self._apply_attack_to_batch(data, targets)
+                
+                data, targets = data.to(device), targets.to(device)
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(data)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.dp_max_grad_norm
+                )
+                
+                self.optimizer.step()
+        
+        self.participation_count += 1
+        
+        # Return model state dict
+        return {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+    
+    def get_model_update_vector(self, global_state_dict: Dict) -> np.ndarray:
+        """Get flattened model update as numpy array."""
+        local_dict = self.model.state_dict()
+        update = []
+        for key in global_state_dict.keys():
+            diff = local_dict[key].cpu().numpy() - global_state_dict[key].cpu().numpy()
+            update.append(diff.flatten())
+        return np.concatenate(update)
+    
+    def secure_mask_update(
+        self, 
+        update: np.ndarray, 
+        participant_ids: List[int]
+    ) -> np.ndarray:
+        """Apply secure aggregation masking."""
         mask = np.zeros_like(update)
-        for key in public_keys:
-            if key != self.client_id:  # Don't mask with own key
+        for other_id in participant_ids:
+            if other_id != self.client_id:
                 # Generate consistent mask using pair identifiers
-                pair = tuple(sorted([self.client_id, key]))
-                # Use a hash that fits within 32-bit integer range
+                pair = tuple(sorted([self.client_id, other_id]))
                 seed = hash(pair) % (2**32 - 1)
-                np.random.seed(seed)
-                mask += np.random.randn(*update.shape)
+                rng = np.random.RandomState(seed)
+                mask += rng.randn(*update.shape)
         return update + mask
 
-    def local_train(self, global_model, lr: float = 0.01, epochs: int = 3):
-        """Perform local training using gradient descent"""
-        # Apply attack for this training round
-        X_train, y_train = self.apply_attack(self.X.copy(), self.y.copy())
-        
-        n_features = X_train.shape[1]
-        w = global_model[:-1].copy()
-        b = global_model[-1].copy()
-        
-        # Train using gradient descent
-        for epoch in range(epochs):
-            indices = np.random.permutation(len(X_train))
-            for i in indices:
-                x = X_train[i]
-                y_true = y_train[i]
-                pred = np.dot(w, x) + b
-                error = pred - y_true
-                w -= lr * error * x
-                b -= lr * error
-        
-        new_model = np.hstack([w, b])
-        
-        # Add trust-based noise
-        base_noise_scale = 0.5 if not self.is_malicious else 5.0
-        noise_loc = 0 if not self.is_malicious else 10
-        effective_scale = base_noise_scale * (1.1 - self.trust_score)
-        noise = np.random.normal(loc=noise_loc, scale=effective_scale, size=new_model.shape)
-        new_model += noise * (1 / self.compute_capacity)
-        
-        self.history.append(noise)
-        self.participation_count += 1
-        return new_model
 
-# =====================
-# SERVER CLASS
-# =====================
+# =============================================================================
+# DEFENSE MECHANISMS
+# =============================================================================
 
-class FederatedLearningServer:
-    def __init__(self, clients: List[Client], model_shape: Tuple, 
-                 use_dp: bool = True, use_he: bool = False,
-                 scaler: Optional[StandardScaler] = None):
-        
-        self.use_he = use_he
-        self.global_model = np.zeros(model_shape)
-        self.clients = clients
-        self.clients_by_id = {c.client_id: c for c in clients}
-        self.selected_history = defaultdict(list)
-        self.round = 0
-        self.current_epsilon = DEFAULT_EPSILON
-        self.use_dp = use_dp
-        self.delta = DEFAULT_DELTA
-        self.sensitivity = DEFAULT_SENSITIVITY
-        self.scaler = scaler
-        
-        # Default configuration
-        self.config = {
-            'min_clients': 3,
-            'selection_method': 'multi_krum',
-            'malicious_ratio': 0.2,
-            'selection_frac': 0.6,
-            'secure_agg': False
-        }
-        
-        # Tracking metrics
-        self.metrics = {
-            'round': [],
-            'avg_trust': [],
-            'malicious_trust': [],
-            'honest_trust': [],
-            'krum_filtered': [],
-            'ata_filtered': [],
-            'model_convergence': [],
-            'privacy_budget': [],
-            'he_used': [],  # Track HE usage
-            'sa_used': [],   # Track SA usage
-            'attack_success': [],
-            'inference_error': [],
-            'inversion_error': [],
-            'attack_rounds': []  # Track rounds when attacks were evaluated
-        }
-        if use_he:
-            self.public_key, self.private_key = paillier.generate_paillier_keypair()
-        
-        self.backdoor_test_data = None  # For backdoor attack evaluation
+class DefenseMechanisms:
+    """Collection of defense mechanisms for FL."""
     
-    def secure_unmask_updates(self, masked_updates: List[np.ndarray], client_ids: List[int]) -> np.ndarray:
-        """Unmask securely aggregated updates and estimate individual updates for trust scoring"""
-        aggregated = np.zeros_like(masked_updates[0])
-        total_data = sum([self.clients_by_id[cid].data_size for cid in client_ids])
+    @staticmethod
+    def multi_krum_scores(
+        updates: List[np.ndarray],
+        trust_scores: List[float],
+        f: int = 1
+    ) -> List[Tuple[float, int]]:
+        """
+        Compute Multi-KRUM scores for Byzantine-fault tolerance.
+        Lower scores indicate more trustworthy updates.
+        """
+        n = len(updates)
+        if n <= 2 * f + 2:
+            f = max(0, (n - 3) // 2)
         
-        # First, unmask the updates
-        for update, client_id in zip(masked_updates, client_ids):
-            mask = np.zeros_like(update)
-            for other_id in client_ids:
-                if other_id != client_id:
-                    pair = tuple(sorted([other_id, client_id]))
-                    seed = hash(pair) % (2**32 - 1)
-                    np.random.seed(seed)
-                    mask += np.random.randn(*update.shape)
-            aggregated += update - mask
-        
-        aggregated = aggregated / len(masked_updates)
-        
-        # Estimate individual contributions for trust scoring
-        for client_id in client_ids:
-            client = self.clients_by_id[client_id]
-            # Approximate update by distributing aggregated update proportionally
-            estimated_update = aggregated * (client.data_size / total_data)
-            client.history.append(estimated_update)  # For trust scoring
-        
-        return aggregated
-
-    def apply_trust_aware_dp(self, updates: List[np.ndarray], clients: List[Client]) -> List[np.ndarray]:
-        """Trust-aware differential privacy mechanism with adaptive epsilon"""
-        if not self.use_dp:
-            return updates
+        scores = []
+        for i in range(n):
+            distances = []
+            for j in range(n):
+                if i != j:
+                    # Trust-weighted distance
+                    dist = np.linalg.norm(updates[i] - updates[j])
+                    trust_weight = 2 - trust_scores[i] - trust_scores[j]
+                    distances.append(dist * trust_weight)
             
-        base_scale = self.sensitivity * np.sqrt(2 * np.log(1.25 / self.delta)) / DEFAULT_EPSILON
+            distances.sort()
+            # Sum of k nearest distances (k = n - f - 2)
+            k = max(1, n - f - 2)
+            score = sum(distances[:k])
+            scores.append((score, i))
+        
+        return sorted(scores, key=lambda x: x[0])
+    
+    @staticmethod
+    def apply_differential_privacy(
+        updates: List[np.ndarray],
+        trust_scores: List[float],
+        epsilon: float = 1.0,
+        delta: float = 1e-5,
+        sensitivity: float = 1.0
+    ) -> List[np.ndarray]:
+        """Apply trust-aware differential privacy noise."""
+        base_scale = sensitivity * np.sqrt(2 * np.log(1.25 / delta)) / epsilon
         
         noisy_updates = []
-        for update, client in zip(updates, clients):
-            # Trust-adjusted epsilon: higher trust -> less noise (higher epsilon)
-            adjusted_epsilon = max(0.5, min(3.0, client.trust_score * 3))
-            effective_scale = base_scale * (DEFAULT_EPSILON / adjusted_epsilon)
+        for update, trust in zip(updates, trust_scores):
+            # Higher trust -> less noise (higher effective epsilon)
+            adjusted_epsilon = max(0.5, min(3.0, trust * 3))
+            effective_scale = base_scale * (epsilon / adjusted_epsilon)
             
             noise = np.random.laplace(loc=0, scale=effective_scale, size=update.shape)
             noisy_updates.append(update + noise)
-            
+        
         return noisy_updates
-
-    def adaptive_trust_scoring(self, selected_clients: List[Client]):
-        """Adaptive Trust Algorithm (ATA) with enhanced metrics"""
-        for client in self.clients:
-            if not client.history:
-                continue
-                
-            # Update consistency (weighted by participation)
-            if len(client.history) > 1:
-                try:
-                    consistency = np.mean([
-                        np.corrcoef(client.history[i], client.history[i+1])[0,1] 
-                        for i in range(len(client.history)-1)
-                    ])
-                except:
-                    consistency = 0.5
-            else:
-                consistency = 0.5
-            
-            # Recent participation rate
-            participation = len([r for r in self.selected_history[client.client_id] 
-                               if r >= self.round - 10]) / 10.0
-            
-            # Update trust score with momentum
-            new_trust = 0.6 * consistency + 0.3 * participation + 0.1 * (client.compute_capacity / 2.0)
-            client.trust_score = 0.8 * client.trust_score + 0.2 * new_trust
-            client.trust_score = np.clip(client.trust_score, 0.1, 1.0)
-        
-        # Track ATA filtering effectiveness
-        malicious_present = sum(1 for c in selected_clients if c.is_malicious)
-        high_trust_malicious = sum(1 for c in selected_clients if c.is_malicious and c.trust_score > 0.7)
-        self.metrics['ata_filtered'].append(malicious_present - high_trust_malicious)
     
-    def aggregate_updates(self, updates: List[np.ndarray], weights: List[float]) -> np.ndarray:
-        """Weighted aggregation with optimized HE support"""
-        if not self.use_he:
-            weights = np.array(weights) / sum(weights)
-            aggregated = np.zeros_like(updates[0])
-            for update, weight in zip(updates, weights):
-                aggregated += update * weight
-            return aggregated
-        else:
-            # Homomorphic aggregation with optimization
-            scale = 1 << 16  # 16-bit fixed-point scaling (2^16)
-            n_features = len(updates[0]) - 1  # Weights only (exclude bias)
-            
-            # Separate weights (features) and bias
-            weight_updates = [update[:-1] for update in updates]
-            bias_updates = [update[-1] for update in updates]
-            
-            # Encrypt and aggregate the weight part
-            encrypted_weights = [0] * n_features
-            for w_update, weight in zip(weight_updates, weights):
-                scaled_update = (w_update * weight * scale).astype(np.int32)
-                for i in range(n_features):
-                    if i >= len(encrypted_weights):  # Ensure index exists
-                        encrypted_weights.append(0)
-                    encrypted_weights[i] = encrypted_weights[i] + self.public_key.encrypt(int(scaled_update[i]))
-            
-            # Decrypt and descale the weights
-            decrypted_weights = np.array([self.private_key.decrypt(x) / scale for x in encrypted_weights])
-            
-            # Aggregate bias normally (without HE)
-            aggregated_bias = np.average(bias_updates, weights=weights)
-            
-            return np.concatenate([decrypted_weights, [aggregated_bias]])
-
-    def _update_metrics(self, avg_update: np.ndarray):
-        """Update all tracking metrics"""
-        self.metrics['round'].append(self.round)
+    @staticmethod
+    def compute_adaptive_trust(
+        client: FLClient,
+        round_num: int,
+        selection_history: Dict[int, List[int]]
+    ) -> float:
+        """Compute adaptive trust score based on client history."""
+        if len(client.update_history) < 2:
+            return client.trust_score
         
-        # Trust metrics
-        trust_scores = [c.trust_score for c in self.clients]
-        self.metrics['avg_trust'].append(np.mean(trust_scores))
-        self.metrics['honest_trust'].append(np.mean([
-            c.trust_score for c in self.clients if not c.is_malicious
-        ]))
-        self.metrics['malicious_trust'].append(np.mean([
-            c.trust_score for c in self.clients if c.is_malicious
-        ]))
+        # Update consistency (correlation between successive updates)
+        try:
+            consistencies = []
+            for i in range(len(client.update_history) - 1):
+                h1 = client.update_history[i].flatten()
+                h2 = client.update_history[i + 1].flatten()
+                if len(h1) > 0 and len(h2) > 0:
+                    corr = np.corrcoef(h1, h2)[0, 1]
+                    if not np.isnan(corr):
+                        consistencies.append(corr)
+            consistency = np.mean(consistencies) if consistencies else 0.5
+        except Exception:
+            consistency = 0.5
         
-        # Convergence metric
-        self.metrics['model_convergence'].append(np.linalg.norm(avg_update))
+        # Recent participation rate
+        recent_rounds = [r for r in selection_history.get(client.client_id, []) 
+                        if r >= round_num - 10]
+        participation = len(recent_rounds) / 10.0
         
-        # Privacy budget tracking
-        avg_trust = np.mean([c.trust_score for c in self.clients])
-        self.metrics['privacy_budget'].append(self.current_epsilon * avg_trust)
-        
-        # Track security method usage
-        self.metrics['he_used'].append(1 if self.use_he else 0)
-        self.metrics['sa_used'].append(1 if self.config.get('secure_agg', False) else 0)
-        
-        # Ensure metrics have default values
-        if len(self.metrics['krum_filtered']) < self.round:
-            self.metrics['krum_filtered'].append(0)
-        if len(self.metrics['ata_filtered']) < self.round:
-            self.metrics['ata_filtered'].append(0)
-        
-        self.round += 1
-
-    def visualize_metrics(self, experiment_name: str = "default"):
-        """Generate comprehensive visualizations including security impacts"""
-        plt.figure(figsize=(18, 15))
-    
-        # Set larger font sizes and line widths
-        plt.rcParams.update({
-            'font.size': 14,
-            'axes.titlesize': 16,
-            'axes.labelsize': 14,
-            'xtick.labelsize': 12,
-            'ytick.labelsize': 12,
-            'legend.fontsize': 12,
-            'lines.linewidth': 2,
-            'patch.linewidth': 2,
-        })
-    
-        # Filter metrics to only show up to round 10
-        max_round = min(10, len(self.metrics['round'])-1)
-        filtered_rounds = [r for r in self.metrics['round'] if r <= max_round]
-        filtered_indices = [i for i, r in enumerate(self.metrics['round']) if r <= max_round]
-    
-        # Trust Score Evolution with Security Highlights
-        plt.subplot(3, 3, 1)
-        plt.plot(filtered_rounds, [self.metrics['avg_trust'][i] for i in filtered_indices], label='Average')
-        plt.plot(filtered_rounds, [self.metrics['honest_trust'][i] for i in filtered_indices], label='Honest')
-        plt.plot(filtered_rounds, [self.metrics['malicious_trust'][i] for i in filtered_indices], label='Malicious')
-        
-        # Highlight rounds where security methods were used
-        he_rounds = [r for i, r in enumerate(filtered_rounds) if self.metrics['he_used'][i]]
-        sa_rounds = [r for i, r in enumerate(filtered_rounds) if self.metrics['sa_used'][i]]
-        
-        if he_rounds:
-            plt.scatter(he_rounds, [self.metrics['avg_trust'][i] for i in filtered_indices if self.metrics['he_used'][i]], 
-                        color='blue', marker='*', s=100, label='HE Used')
-        if sa_rounds:
-            plt.scatter(sa_rounds, [self.metrics['avg_trust'][i] for i in filtered_indices if self.metrics['sa_used'][i]], 
-                        color='red', marker='o', s=80, label='SA Used')
-        
-        plt.title('Trust Score Evolution with Security Highlights')
-        plt.xlabel('Training Round')
-        plt.ylabel('Trust Score')
-        plt.legend()
-        plt.grid(True)
-    
-        # Filtering Effectiveness with Security Highlights
-        plt.subplot(3, 3, 2)
-        # Use available data or pad with zeros
-        krum_data = []
-        ata_data = []
-        for i in filtered_indices:
-            if i < len(self.metrics['krum_filtered']):
-                krum_data.append(self.metrics['krum_filtered'][i])
-            else:
-                krum_data.append(0)
-                
-            if i < len(self.metrics['ata_filtered']):
-                ata_data.append(self.metrics['ata_filtered'][i])
-            else:
-                ata_data.append(0)
-                
-        plt.plot(filtered_rounds, krum_data, label='KRUM Filtered')
-        plt.plot(filtered_rounds, ata_data, label='ATA Filtered')
-        
-        # Highlight security method usage
-        if he_rounds:
-            plt.scatter(he_rounds, [krum_data[i] for i, r in enumerate(filtered_rounds) if r in he_rounds], 
-                        color='blue', marker='*', s=100, label='HE Used')
-        if sa_rounds:
-            plt.scatter(sa_rounds, [krum_data[i] for i, r in enumerate(filtered_rounds) if r in sa_rounds], 
-                        color='red', marker='o', s=80, label='SA Used')
-        
-        plt.title('Malicious Clients Filtered per Round')
-        plt.xlabel('Training Round')
-        plt.ylabel('Count')
-        plt.legend()
-        plt.grid(True)
-    
-        # Model Convergence with Security Impact
-        plt.subplot(3, 3, 3)
-        plt.plot(filtered_rounds, [self.metrics['model_convergence'][i] for i in filtered_indices], label='Convergence')
-        
-        # Add security method indicators
-        if he_rounds:
-            plt.scatter(he_rounds, [self.metrics['model_convergence'][i] for i in filtered_indices if self.metrics['he_used'][i]], 
-                        color='blue', marker='*', s=100, label='HE Used')
-        if sa_rounds:
-            plt.scatter(sa_rounds, [self.metrics['model_convergence'][i] for i in filtered_indices if self.metrics['sa_used'][i]], 
-                        color='red', marker='o', s=80, label='SA Used')
-        
-        plt.title('Model Convergence with Security Impact')
-        plt.xlabel('Training Round')
-        plt.ylabel('Update Norm')
-        plt.legend()
-        plt.grid(True)
-    
-        # Privacy Budget with Security Highlights
-        plt.subplot(3, 3, 4)
-        plt.plot(filtered_rounds, [self.metrics['privacy_budget'][i] for i in filtered_indices])
-        
-        # Highlight security method usage
-        has_legend = False
-        if he_rounds:
-            plt.scatter(he_rounds, [self.metrics['privacy_budget'][i] for i in filtered_indices if self.metrics['he_used'][i]], 
-                        color='blue', marker='*', s=100, label='HE Used')
-            has_legend = True
-        if sa_rounds:
-            plt.scatter(sa_rounds, [self.metrics['privacy_budget'][i] for i in filtered_indices if self.metrics['sa_used'][i]], 
-                        color='red', marker='o', s=80, label='SA Used')
-            has_legend = True
-        
-        plt.title('Effective Privacy Budget (ε)')
-        plt.xlabel('Training Round')
-        plt.ylabel('ε value')
-        if has_legend:
-            plt.legend()
-        plt.grid(True)
-    
-        # Trust Distribution
-        plt.subplot(3, 3, 5)
-        sns.histplot([c.trust_score for c in self.clients if not c.is_malicious], 
-                    color='green', label='Honest', kde=True)
-        sns.histplot([c.trust_score for c in self.clients if c.is_malicious], 
-                    color='red', label='Malicious', kde=True)
-        plt.title('Final Trust Score Distribution')
-        plt.xlabel('Trust Score')
-        plt.ylabel('Count')
-        plt.legend()
-    
-        # Participation Heatmap
-        plt.subplot(3, 3, 6)
-        participation = [c.participation_count for c in self.clients]
-        plt.hist(participation, bins=20, edgecolor='black')
-        plt.title('Client Participation Distribution')
-        plt.xlabel('Times Selected')
-        plt.ylabel('Count')
-        
-        # Security Method Impact Comparison
-        plt.subplot(3, 3, 7)
-        methods = ['Baseline', 'HE', 'SA', 'HE+SA']
-        
-        # Calculate metrics for each method
-        base_conv = np.mean(self.metrics['model_convergence'][:5]) if self.metrics['model_convergence'] else 0
-        he_conv = base_conv * 1.05  # HE slightly reduces convergence speed
-        sa_conv = base_conv * 1.02  # SA has minimal impact
-        he_sa_conv = base_conv * 1.08  # Combined effect
-        
-        plt.bar(methods, [base_conv, he_conv, sa_conv, he_sa_conv], 
-               color=['blue', 'green', 'orange', 'red'])
-        plt.title('Security Method Impact on Convergence')
-        plt.ylabel('Average Update Norm')
-        
-        # Security vs Accuracy
-        plt.subplot(3, 3, 8)
-        # These would come from actual experiments
-        base_acc = 0.85
-        he_acc = 0.83
-        sa_acc = 0.84
-        he_sa_acc = 0.82
-        
-        plt.bar(methods, [base_acc, he_acc, sa_acc, he_sa_acc], 
-               color=['blue', 'green', 'orange', 'red'])
-        plt.title('Security Method Impact on Accuracy')
-        plt.ylabel('Test Accuracy')
-        plt.ylim(0.7, 0.9)
-        
-        # Security Method Usage Timeline
-        plt.subplot(3, 3, 9)
-        plt.plot(filtered_rounds, self.metrics['he_used'][:len(filtered_rounds)], 
-                'b-', label='HE Enabled')
-        plt.plot(filtered_rounds, self.metrics['sa_used'][:len(filtered_rounds)], 
-                'r--', label='SA Enabled')
-        plt.title('Security Method Usage Over Rounds')
-        plt.xlabel('Training Round')
-        plt.ylabel('Enabled (1) / Disabled (0)')
-        plt.legend()
-        plt.grid(True)
-        plt.yticks([0, 1])
-    
-        plt.tight_layout()
-        plt.savefig(f'fl_metrics_{experiment_name}.png')
-        plt.show()
-        
-    def visualize_attacks(self, experiment_name: str = "attacks"):
-        """Visualize attack success metrics"""
-        plt.figure(figsize=(15, 10))
-        
-        # Only plot rounds where attacks were evaluated
-        attack_rounds = self.metrics['attack_rounds']
-        if not attack_rounds:
-            print("No attack metrics to visualize")
-            return
-            
-        # Filter to max round 10
-        attack_rounds = [r for r in attack_rounds if r <= 10]
-        n_points = len(attack_rounds)
-        
-        # Attack Success Rate (Backdoor)
-        plt.subplot(2, 2, 1)
-        plt.plot(attack_rounds, self.metrics['attack_success'][:n_points], 'r-o')
-        plt.title('Backdoor Attack Success Rate')
-        plt.xlabel('Training Round')
-        plt.ylabel('Success Rate')
-        plt.ylim(0, 1.1)
-        plt.grid(True)
-        
-        # Inference Attack Error
-        plt.subplot(2, 2, 2)
-        plt.plot(attack_rounds, self.metrics['inference_error'][:n_points], 'b-s')
-        plt.title('Model Inference Attack Error')
-        plt.xlabel('Training Round')
-        plt.ylabel('Reconstruction Error')
-        plt.grid(True)
-        
-        # Model Inversion Error
-        plt.subplot(2, 2, 3)
-        plt.plot(attack_rounds, self.metrics['inversion_error'][:n_points], 'g-D')
-        plt.title('Model Inversion Attack Error')
-        plt.xlabel('Training Round')
-        plt.ylabel('Reconstruction Error')
-        plt.grid(True)
-        
-        # Defense Effectiveness
-        plt.subplot(2, 2, 4)
-        defense_effectiveness = [
-            1 - min(s, 1) for s in self.metrics['attack_success'][:n_points]
-        ]
-        plt.plot(attack_rounds, defense_effectiveness, 'm-^')
-        plt.title('Defense Effectiveness Against Backdoor Attacks')
-        plt.xlabel('Training Round')
-        plt.ylabel('Effectiveness (1 - Success Rate)')
-        plt.ylim(-0.1, 1.1)
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(f'attack_metrics_{experiment_name}.png')
-        plt.show()
-        
-    def evaluate_attacks(self):
-        """Evaluate success of various attacks"""
-        # Record the current round
-        current_round = self.round
-        self.metrics['attack_rounds'].append(current_round)
-        
-        # Backdoor attack success rate
-        backdoor_success = 0
-        if self.backdoor_test_data is not None:
-            X_bd, y_bd = self.backdoor_test_data
-            if len(X_bd) > 0:
-                w = self.global_model[:-1]
-                b = self.global_model[-1]
-                preds = (X_bd.dot(w) + b) > 0.5
-                backdoor_success = accuracy_score(y_bd, preds)
-        
-        # Inference attack simulation
-        inference_errors = []
-        for client in self.clients:
-            if client.is_malicious and client.attack_type == "inference":
-                error = AttackMethods.inference_attack(self, client)
-                inference_errors.append(error)
-        
-        # Model inversion simulation
-        inversion_errors = []
-        for client in self.clients:
-            if client.is_malicious and client.attack_type == "inversion":
-                inverted = AttackMethods.model_inversion(client, self.global_model)
-                # Calculate reconstruction error (simplified)
-                if len(client.X) > 0:
-                    avg_sample = np.mean(client.X, axis=0)
-                    error = np.linalg.norm(inverted - avg_sample)
-                    inversion_errors.append(error)
-        
-        # Store metrics
-        self.metrics['attack_success'].append(backdoor_success)
-        self.metrics['inference_error'].append(np.mean(inference_errors) if inference_errors else 0)
-        self.metrics['inversion_error'].append(np.mean(inversion_errors) if inversion_errors else 0)
-        
-        return backdoor_success
-    
-    def select_clients(self, selection_frac: float = None) -> List[Client]:
-        """Select clients for the current training round"""
-        if selection_frac is None:
-            selection_frac = self.config.get('selection_frac', 0.6)
-            
-        num_selected = max(
-            self.config.get('min_clients', 3),
-            int(len(self.clients) * selection_frac)
+        # Compute new trust with momentum
+        new_trust = (
+            0.6 * consistency + 
+            0.3 * participation + 
+            0.1 * (client.compute_capacity / 2.0)
         )
         
-        # Create candidate pool considering network speed
-        candidates = sorted(
-            self.clients,
-            key=lambda c: c.network_speed,
-            reverse=True
-        )[:num_selected * 3]  # Consider top network performers
+        # Exponential moving average
+        updated_trust = 0.8 * client.trust_score + 0.2 * new_trust
+        return np.clip(updated_trust, 0.1, 1.0)
+
+
+# =============================================================================
+# FEDERATED LEARNING SERVER
+# =============================================================================
+
+class FLServer:
+    """Federated Learning server with graph topology and security mechanisms."""
+    
+    def __init__(self, config: FLConfig, model_factory: Callable[[], nn.Module]):
+        self.config = config
+        self.model_factory = model_factory
+        self.global_model = model_factory()
+        self.clients: List[FLClient] = []
+        self.graph: Optional[nx.Graph] = None
         
-        # Apply selection method
-        method = self.config.get('selection_method', 'multi_krum').lower()
+        # Tracking
+        self.round = 0
+        self.selection_history: Dict[int, List[int]] = defaultdict(list)
+        self.metrics = {
+            'round': [],
+            'accuracy': [],
+            'loss': [],
+            'avg_trust': [],
+            'honest_trust': [],
+            'malicious_trust': [],
+            'krum_filtered': [],
+            'convergence': [],
+            'attack_success': [],
+        }
         
-        if method == 'multi_krum':
-            selected = self.multi_krum_selection(candidates, num_selected)
-        elif method == 'random':
-            selected = random.sample(candidates, num_selected)
-        elif method == 'trust_based':
-            selected = self.trust_based_selection(candidates, num_selected)
+        # Homomorphic encryption keys
+        self.public_key = None
+        self.private_key = None
+        if config.use_homomorphic_encryption and PAILLIER_AVAILABLE:
+            self.public_key, self.private_key = paillier.generate_paillier_keypair()
+    
+    def setup_clients(self, client_datasets: List[Dataset]):
+        """Initialize clients with their datasets."""
+        attack_types = [AttackType.NONE] + list(self.config.attack_types)
+        
+        for i, dataset in enumerate(client_datasets):
+            is_malicious = random.random() < self.config.malicious_ratio
+            attack_type = (
+                random.choice(self.config.attack_types) 
+                if is_malicious and self.config.attack_types 
+                else AttackType.NONE
+            )
+            
+            client = FLClient(
+                client_id=i,
+                dataset=dataset,
+                config=self.config,
+                is_malicious=is_malicious,
+                attack_type=attack_type,
+                compute_capacity=random.uniform(0.5, 2.0),
+                network_speed=random.uniform(0.5, 2.0),
+            )
+            
+            # Setup client's model
+            client.setup_model(self.model_factory())
+            self.clients.append(client)
+        
+        # Build graph topology
+        if self.config.use_graph_topology:
+            self._build_graph()
+        
+        print(f"Initialized {len(self.clients)} clients")
+        print(f"  Malicious: {sum(1 for c in self.clients if c.is_malicious)}")
+        print(f"  Graph edges: {self.graph.number_of_edges() if self.graph else 0}")
+    
+    def _build_graph(self):
+        """Build graph topology connecting clients."""
+        self.graph = nx.erdos_renyi_graph(
+            len(self.clients), 
+            self.config.graph_connection_prob
+        )
+        
+        # Assign neighbors to clients
+        for client in self.clients:
+            client.neighbors = list(self.graph.neighbors(client.client_id))
+    
+    def _select_clients(self, device: torch.device = torch.device('cpu')) -> List[FLClient]:
+        """Select clients for current round based on selection method."""
+        num_selected = max(
+            self.config.min_clients_per_round,
+            int(len(self.clients) * self.config.selection_fraction)
+        )
+        
+        # Apply hierarchical defense scheduling
+        method = self.config.selection_method
+        if self.config.enable_hierarchical_defense:
+            if self.round < 4:
+                method = SelectionMethod.MULTI_KRUM
+            elif self.round < 7:
+                method = SelectionMethod.TRUST_BASED
+            else:
+                method = SelectionMethod.RANDOM
+        
+        if method == SelectionMethod.RANDOM:
+            selected = random.sample(self.clients, num_selected)
+        
+        elif method == SelectionMethod.TRUST_BASED:
+            # Sort by trust score
+            scored = [(c.trust_score, c) for c in self.clients]
+            scored.sort(reverse=True, key=lambda x: x[0])
+            selected = [c for _, c in scored[:num_selected]]
+        
+        elif method == SelectionMethod.MULTI_KRUM:
+            # Get updates from all clients first
+            global_dict = self.global_model.state_dict()
+            updates = []
+            trust_scores = []
+            
+            for client in self.clients:
+                client.train_local(global_dict, device)  # Pass device parameter
+                update = client.get_model_update_vector(global_dict)
+                updates.append(update)
+                trust_scores.append(client.trust_score)
+            
+            # Compute KRUM scores
+            f = max(1, int(len(self.clients) * self.config.malicious_ratio))
+            krum_scores = DefenseMechanisms.multi_krum_scores(
+                updates, trust_scores, f
+            )
+            
+            # Select top clients
+            selected_indices = [idx for _, idx in krum_scores[:num_selected]]
+            selected = [self.clients[i] for i in selected_indices]
+            
+            # Track filtered malicious clients
+            malicious_before = sum(1 for c in self.clients if c.is_malicious)
+            malicious_after = sum(1 for c in selected if c.is_malicious)
+            self.metrics['krum_filtered'].append(malicious_before - malicious_after)
+        
         else:
-            raise ValueError(f"Unknown selection method: {method}")
+            selected = random.sample(self.clients, num_selected)
         
         # Update selection history
         for client in selected:
-            self.selected_history[client.client_id].append(self.round)
+            self.selection_history[client.client_id].append(self.round)
         
         return selected
     
-    def trust_based_selection(self, candidates: List[Client], m: int) -> List[Client]:
-        """Select clients based on trust scores and other factors"""
-        scored_clients = []
-        for client in candidates:
-            # Weighted score considering trust, compute, and network
-            score = (0.5 * client.trust_score + 
-                    0.3 * client.compute_capacity + 
-                    0.2 * client.network_speed)
-            scored_clients.append((score, client))
+    def _aggregate_updates(
+        self, 
+        selected_clients: List[FLClient],
+        device: torch.device
+    ) -> Dict:
+        """Aggregate model updates from selected clients."""
+        global_dict = {k: v.clone() for k, v in self.global_model.state_dict().items()}
         
-        # Sort by score and select top m
-        scored_clients.sort(reverse=True, key=lambda x: x[0])
-        return [client for (score, client) in scored_clients[:m]]
+        # Collect updates
+        client_updates = []
+        weights = []
+        
+        for client in selected_clients:
+            # Training already done in selection for MULTI_KRUM
+            if self.config.selection_method != SelectionMethod.MULTI_KRUM:
+                client.train_local(global_dict, device)
+            
+            client_dict = client.model.state_dict()
+            client_updates.append(client_dict)
+            
+            # Weight by data size and trust
+            weight = len(client.dataset) * client.trust_score * client.compute_capacity
+            weights.append(weight)
+            
+            # Store update history for trust computation
+            update_vector = client.get_model_update_vector(global_dict)
+            client.update_history.append(update_vector)
+            if len(client.update_history) > 10:
+                client.update_history.pop(0)
+        
+        # Normalize weights
+        total_weight = sum(weights)
+        weights = [w / total_weight for w in weights]
+        
+        # Apply differential privacy if enabled
+        if self.config.use_dp:
+            # Apply noise to weight vectors
+            flat_updates = [
+                np.concatenate([v.cpu().numpy().flatten() for v in u.values()])
+                for u in client_updates
+            ]
+            trust_scores = [c.trust_score for c in selected_clients]
+            
+            noisy_updates = DefenseMechanisms.apply_differential_privacy(
+                flat_updates,
+                trust_scores,
+                epsilon=self.config.dp_epsilon,
+                delta=self.config.dp_delta
+            )
+            
+            # Reconstruct state dicts with noise - ensure correct device
+            for i, (client_dict, noisy_flat) in enumerate(zip(client_updates, noisy_updates)):
+                idx = 0
+                for key in client_dict:
+                    shape = client_dict[key].shape
+                    size = client_dict[key].numel()
+                    client_dict[key] = torch.tensor(
+                        noisy_flat[idx:idx + size].reshape(shape),
+                        dtype=client_dict[key].dtype,
+                        device=device  # FIX: Ensure tensor is on correct device
+                    )
+                    idx += size
+        
+        # Weighted aggregation - ensure all tensors on same device
+        aggregated = {k: torch.zeros_like(v).to(device) for k, v in global_dict.items()}
+        for client_dict, weight in zip(client_updates, weights):
+            for key in aggregated:
+                # Move client tensor to device before aggregation
+                client_tensor = client_dict[key].to(device).float()
+                aggregated[key] += weight * client_tensor
+        
+        return aggregated
     
-    def multi_krum_selection(self, candidates: List[Client], m: int) -> List[Client]:
-        """Multi-KRUM with trust-aware filtering"""
-        updates = []
-        for client in candidates:
-            # Get local update
-            local_model = client.local_train(self.global_model)
-            update = local_model - self.global_model
-            updates.append(update)
-        
-        krum_scores = []
-        for i, (client, update) in enumerate(zip(candidates, updates)):
-            distances = []
-            for j, (other_client, other_update) in enumerate(zip(candidates, updates)):
-                if i != j:
-                    # Trust-weighted distance metric
-                    dist = np.linalg.norm(update - other_update) * (2 - client.trust_score - other_client.trust_score)
-                    distances.append(dist)
-        
-            distances.sort()
-            f = max(1, int(len(candidates) * self.config.get('malicious_ratio', 0.2)))
-            score = sum(distances[:len(candidates)-f-1])
-            krum_scores.append((score, i))  # Store index instead of client object
+    def _update_trust_scores(self, selected_clients: List[FLClient]):
+        """Update trust scores for all clients."""
+        for client in self.clients:
+            client.trust_score = DefenseMechanisms.compute_adaptive_trust(
+                client, self.round, self.selection_history
+            )
     
-        # Sort by score and select top m candidates
-        krum_scores.sort()  # Sorts based on first tuple element (score)
-        selected_indices = [idx for (score, idx) in krum_scores[:m]]
-        selected = [candidates[i] for i in selected_indices]
-    
-        # Track how many malicious clients were filtered
-        malicious_filtered = sum(1 for c in candidates if c.is_malicious) - sum(1 for c in selected if c.is_malicious)
-        self.metrics['krum_filtered'].append(malicious_filtered)
-    
-        return selected
-
-    def train_round(self):
-        """Complete training round with hierarchical defense scheduling"""
-        # Hierarchical Defense Scheduling
-        if self.round < 4:  # Early phase: rounds 0-3
-            self.config['selection_method'] = 'multi_krum'
-            self.current_epsilon = 0.8  # Stronger DP (lower epsilon)
-            self.config['secure_agg'] = True  # Use SA
-        elif 4 <= self.round < 7:  # Middle phase: rounds 4-6
-            self.config['selection_method'] = 'trust_based'
-            self.current_epsilon = 1.2
-            self.config['secure_agg'] = True
-        else:  # Final phase: rounds 7+
-            self.config['selection_method'] = 'random'
-            self.current_epsilon = 2.0  # Weaker DP
-            self.config['secure_agg'] = False  # Disable SA for faster convergence
+    def train_round(self, device: torch.device = torch.device('cpu')) -> Dict:
+        """Execute one round of federated training."""
+        print(f"\n--- Round {self.round + 1} ---")
         
-        # Client selection
-        selected = self.select_clients()
+        # Select clients
+        selected = self._select_clients(device)
+        print(f"Selected {len(selected)} clients (malicious: {sum(1 for c in selected if c.is_malicious)})")
         
-        # Check if secure aggregation is enabled
-        if self.config.get('secure_agg', False):
-            # Secure aggregation protocol
-            public_keys = [c.client_id for c in selected]
-            masked_updates = []
-            weights = []
-            
-            for client in selected:
-                # Train locally and get update
-                local_model = client.local_train(self.global_model)
-                update = local_model - self.global_model
-                # Apply masking for secure aggregation
-                masked_update = client.secure_mask_update(update, public_keys)
-                masked_updates.append(masked_update)
-                weights.append(client.data_size * client.trust_score * client.compute_capacity)
-            
-            # Aggregate using secure unmasking
-            avg_update = self.secure_unmask_updates(masked_updates, public_keys)
-            
-        else:
-            # Standard aggregation protocol
-            updates = []
-            weights = []
-            
-            for client in selected:
-                # Train locally and get update
-                local_model = client.local_train(self.global_model)
-                update = local_model - self.global_model
-                updates.append(update)
-                weights.append(client.data_size * client.trust_score * client.compute_capacity)
-            
-            # Apply trust-aware DP if enabled
-            if self.use_dp:
-                updates = self.apply_trust_aware_dp(updates, selected)
-            
-            # Aggregate updates (using HE if enabled)
-            avg_update = self.aggregate_updates(updates, weights)
+        # Aggregate updates
+        aggregated = self._aggregate_updates(selected, device)
         
         # Update global model
-        self.global_model += avg_update
+        self.global_model.load_state_dict(aggregated)
         
         # Update trust scores
-        self.adaptive_trust_scoring(selected)
+        self._update_trust_scores(selected)
         
-        # Track metrics
-        self._update_metrics(avg_update)
+        # Update metrics
+        self.metrics['round'].append(self.round)
+        self.metrics['avg_trust'].append(np.mean([c.trust_score for c in self.clients]))
+        self.metrics['honest_trust'].append(
+            np.mean([c.trust_score for c in self.clients if not c.is_malicious])
+        )
+        malicious_trusts = [c.trust_score for c in self.clients if c.is_malicious]
+        self.metrics['malicious_trust'].append(
+            np.mean(malicious_trusts) if malicious_trusts else 0
+        )
         
-        # Evaluate attacks every 5 rounds
-        if self.round % 5 == 0:
-            self.evaluate_attacks()
+        self.round += 1
+        return aggregated
+    
+    def evaluate(
+        self, 
+        test_loader: DataLoader, 
+        device: torch.device = torch.device('cpu')
+    ) -> Tuple[float, float]:
+        """Evaluate global model on test data."""
+        self.global_model.to(device)
+        self.global_model.eval()
         
-        return self.global_model
+        correct = 0
+        total = 0
+        total_loss = 0
+        criterion = nn.CrossEntropyLoss()
+        
+        with torch.no_grad():
+            for data, targets in test_loader:
+                data, targets = data.to(device), targets.to(device)
+                outputs = self.global_model(data)
+                loss = criterion(outputs, targets)
+                total_loss += loss.item()
+                
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        
+        accuracy = correct / total if total > 0 else 0
+        avg_loss = total_loss / len(test_loader) if len(test_loader) > 0 else 0
+        
+        self.metrics['accuracy'].append(accuracy)
+        self.metrics['loss'].append(avg_loss)
+        
+        return accuracy, avg_loss
+    
+    def visualize_metrics(self, save_path: Optional[str] = None):
+        """Generate visualization of training metrics."""
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Accuracy over rounds
+        ax = axes[0, 0]
+        if self.metrics['accuracy']:
+            ax.plot(self.metrics['round'][:len(self.metrics['accuracy'])], 
+                   self.metrics['accuracy'], 'b-o')
+            ax.set_title('Model Accuracy')
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Accuracy')
+            ax.grid(True)
+        
+        # Loss over rounds
+        ax = axes[0, 1]
+        if self.metrics['loss']:
+            ax.plot(self.metrics['round'][:len(self.metrics['loss'])], 
+                   self.metrics['loss'], 'r-o')
+            ax.set_title('Training Loss')
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Loss')
+            ax.grid(True)
+        
+        # Trust scores evolution
+        ax = axes[0, 2]
+        if self.metrics['avg_trust']:
+            ax.plot(self.metrics['round'], self.metrics['avg_trust'], 
+                   label='Average', color='blue')
+            ax.plot(self.metrics['round'], self.metrics['honest_trust'], 
+                   label='Honest', color='green')
+            ax.plot(self.metrics['round'], self.metrics['malicious_trust'], 
+                   label='Malicious', color='red')
+            ax.set_title('Trust Score Evolution')
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Trust Score')
+            ax.legend()
+            ax.grid(True)
+        
+        # Trust score distribution
+        ax = axes[1, 0]
+        honest_scores = [c.trust_score for c in self.clients if not c.is_malicious]
+        malicious_scores = [c.trust_score for c in self.clients if c.is_malicious]
+        if honest_scores:
+            ax.hist(honest_scores, alpha=0.7, label='Honest', color='green', bins=10)
+        if malicious_scores:
+            ax.hist(malicious_scores, alpha=0.7, label='Malicious', color='red', bins=10)
+        ax.set_title('Final Trust Score Distribution')
+        ax.set_xlabel('Trust Score')
+        ax.set_ylabel('Count')
+        ax.legend()
+        
+        # KRUM filtering effectiveness
+        ax = axes[1, 1]
+        if self.metrics['krum_filtered']:
+            ax.bar(range(len(self.metrics['krum_filtered'])), 
+                  self.metrics['krum_filtered'], color='purple')
+            ax.set_title('Malicious Clients Filtered (Multi-KRUM)')
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Count')
+        
+        # Network graph
+        ax = axes[1, 2]
+        if self.graph:
+            colors = ['red' if self.clients[i].is_malicious else 'green' 
+                     for i in range(len(self.clients))]
+            pos = nx.spring_layout(self.graph, seed=42)
+            nx.draw(self.graph, pos, ax=ax, node_color=colors, 
+                   with_labels=True, node_size=500, font_size=8)
+            ax.set_title('Client Graph (Red=Malicious)')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Saved visualization to {save_path}")
+        
+        plt.show()
 
-# =====================
-# ECG FEATURE EXTRACTION
-# =====================
 
-def extract_ecg_features(ecg_signal: np.ndarray, sampling_rate: int = 500) -> np.ndarray:
-    """Extract consistent ECG features with error handling"""
-    try:
-        # Preprocess ECG signal
-        cleaned = nk.ecg_clean(ecg_signal, sampling_rate=sampling_rate)
-        
-        # Time-domain features (6 features)
-        time_features = [
-            np.mean(cleaned),
-            np.std(cleaned),
-            signal.peak_prominences(cleaned, signal.find_peaks(cleaned)[0])[0].mean() if len(cleaned) > 10 else 0,
-            np.median(cleaned),
-            np.mean(np.diff(cleaned)),  # Mean of first difference
-            np.percentile(cleaned, 75) - np.percentile(cleaned, 25)  # IQR
-        ]
-        
-        # Frequency-domain features (4 features)
-        f, Pxx = signal.welch(cleaned, fs=sampling_rate, nperseg=min(256, len(cleaned)))
-        
-        # Get frequency bands
-        mask_total = (f >= 0.04) & (f <= 0.4)
-        mask_lf = (f >= 0.04) & (f <= 0.15)
-        mask_hf = (f > 0.15) & (f <= 0.4)
-        
-        freq_features = [
-            np.trapz(Pxx[mask_total], f[mask_total]),  # Total power (0.04-0.4Hz)
-            np.trapz(Pxx[mask_lf], f[mask_lf]),        # LF power (0.04-0.15Hz)
-            np.trapz(Pxx[mask_hf], f[mask_hf]),        # HF power (0.15-0.4Hz)
-        ]
-        
-        # Calculate LF/HF ratio with zero division protection
-        hf_power = freq_features[2]
-        lf_hf_ratio = freq_features[1] / hf_power if hf_power > 0 else 0
-        freq_features.append(lf_hf_ratio)
-        
-        # HRV features (simplified)
-        hrv_features = np.zeros(12)
-        try:
-            _, rpeaks = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
-            if len(rpeaks['ECG_R_Peaks']) > 5:
-                rr_intervals = np.diff(rpeaks['ECG_R_Peaks']) / sampling_rate * 1000
-                hrv_features = [
-                    np.mean(rr_intervals),
-                    np.std(rr_intervals),
-                    np.min(rr_intervals),
-                    np.max(rr_intervals),
-                ]
-        except:
-            pass
-        
-        return np.concatenate([time_features, hrv_features, freq_features])
-    
-    except Exception as e:
-        print(f"Feature extraction error: {e}")
-        return np.zeros(22)  # Return array with consistent shape
+# =============================================================================
+# EXPERIMENT RUNNER
+# =============================================================================
 
-# =====================
-# DATA LOADING
-# =====================
+def run_mnist_experiment(config: FLConfig) -> FLServer:
+    """Run federated learning experiment on MNIST dataset."""
+    if not TORCHVISION_AVAILABLE:
+        raise ImportError("torchvision required for MNIST experiment")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load MNIST
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    
+    train_dataset = datasets.MNIST(
+        root='./data', train=True, download=True, transform=transform
+    )
+    test_dataset = datasets.MNIST(
+        root='./data', train=False, download=True, transform=transform
+    )
+    
+    # Partition data among clients (IID)
+    data_per_client = len(train_dataset) // config.num_clients
+    lengths = [data_per_client] * config.num_clients
+    lengths[-1] += len(train_dataset) - sum(lengths)  # Handle remainder
+    
+    client_datasets = random_split(train_dataset, lengths)
+    
+    # Initialize server
+    server = FLServer(config, model_factory=CNN)
+    server.setup_clients(client_datasets)
+    
+    # Test data loader
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    
+    # Training loop
+    start_time = time.time()
+    
+    for round_num in range(config.num_rounds):
+        server.train_round(device)
+        accuracy, loss = server.evaluate(test_loader, device)
+        print(f"  Accuracy: {accuracy*100:.2f}%, Loss: {loss:.4f}")
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nTotal training time: {elapsed_time:.2f} seconds")
+    
+    return server
 
-def load_subject_data(subject_id: str, data_path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Load and process data with consistent feature dimensions"""
-    try:
-        gender = 'F' if subject_id in ['3', '4', '11'] else 'M'
-        ecg_path = data_path / 'Biopac_data' / 'ECG' / f'Subject{subject_id}{gender}_ECG.csv'
+
+def run_synthetic_experiment(config: FLConfig, n_features: int = 20) -> FLServer:
+    """Run federated learning experiment on synthetic data."""
+    
+    # Generate synthetic data
+    class SyntheticDataset(Dataset):
+        def __init__(self, X: np.ndarray, y: np.ndarray):
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.y = torch.tensor(y, dtype=torch.long)
         
-        if not ecg_path.exists():
-            print(f"ECG file not found: {ecg_path}")
-            return np.zeros((0, 22)), np.zeros(0)  # Return empty arrays with correct feature dim
+        def __len__(self):
+            return len(self.X)
         
-        # Read ECG data - handle single column case
-        ecg_data = pd.read_csv(ecg_path, header=None)
-        ecg_values = ecg_data.iloc[:, 0].values  # Take first column
+        def __getitem__(self, idx):
+            return self.X[idx], self.y[idx]
+    
+    # Create synthetic data for each client
+    client_datasets = []
+    for i in range(config.num_clients):
+        n_samples = random.randint(100, 500)
+        X = np.random.randn(n_samples, n_features)
+        # Create separable classes
+        w_true = np.random.randn(n_features)
+        y = (X.dot(w_true) > 0).astype(int)
+        # Add some label noise
+        noise_idx = np.random.choice(n_samples, n_samples // 10, replace=False)
+        y[noise_idx] = 1 - y[noise_idx]
         
-        # Process windows
-        X, y = [], []
-        window_size = 30 * 500  # 30 seconds at 500Hz
-        step_size = 30 * 500    # Reduced overlap for fewer samples
-        
-        for i in range(0, len(ecg_values) - window_size, step_size):
-            window = ecg_values[i:i+window_size]
-            features = extract_ecg_features(window)
-            X.append(features)
-            y.append(i % 2)  # Alternate labels
-            
-        return np.array(X), np.array(y)
-        
-    except Exception as e:
-        print(f"Error loading subject {subject_id}: {str(e)}")
-        return np.zeros((0, 22)), np.zeros(0)
+        client_datasets.append(SyntheticDataset(X, y))
+    
+    # Create test data
+    n_test = 1000
+    X_test = np.random.randn(n_test, n_features)
+    w_true = np.random.randn(n_features)
+    y_test = (X_test.dot(w_true) > 0).astype(int)
+    test_dataset = SyntheticDataset(X_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    
+    # Model factory for synthetic data
+    def model_factory():
+        return SimpleMLP(input_dim=n_features, hidden_dim=64, num_classes=2)
+    
+    # Initialize server
+    server = FLServer(config, model_factory=model_factory)
+    server.setup_clients(client_datasets)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Training loop
+    start_time = time.time()
+    
+    for round_num in range(config.num_rounds):
+        server.train_round(device)
+        accuracy, loss = server.evaluate(test_loader, device)
+        print(f"  Accuracy: {accuracy*100:.2f}%, Loss: {loss:.4f}")
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nTotal training time: {elapsed_time:.2f} seconds")
+    
+    return server
 
-def create_clients(data_path: Path, n_features: int = 22) -> Tuple[List[Client], StandardScaler]:
-    """Create clients with consistent feature dimensions"""
-    subjects = ['3', '4', '6', '8', '11']
-    all_features = []
-    all_labels = []
-    clients = []
-    
-    # First pass to collect all features for scaling
-    for subj_id in subjects:
-        X, y = load_subject_data(subj_id, data_path)
-        if len(X) > 0:
-            # Ensure features have correct dimension
-            if X.shape[1] != n_features:
-                print(f"Warning: Subject {subj_id} has {X.shape[1]} features, expected {n_features}")
-                # Pad or truncate features to match expected dimension
-                if X.shape[1] < n_features:
-                    padding = np.zeros((len(X), n_features - X.shape[1]))
-                    X = np.hstack([X, padding])
-                else:
-                    X = X[:, :n_features]
-            all_features.append(X)
-            all_labels.append(y)
-    
-    # Handle case where no real data was loaded
-    if len(all_features) == 0:
-        print("No real data found - using synthetic data")
-        all_features = [np.random.randn(20, n_features) for _ in subjects]  # Fewer samples
-        all_labels = [np.random.randint(0, 2, 20) for _ in subjects]
-    
-    # Create and fit scaler
-    scaler = StandardScaler()
-    try:
-        scaler.fit(np.vstack(all_features))
-    except Exception as e:
-        print(f"Scaling failed: {e} - using identity transform")
-        scaler.mean_ = np.zeros(n_features)
-        scaler.scale_ = np.ones(n_features)
-    
-    # Attack types for malicious clients
-    attack_types = ["poison", "backdoor", "inference", "inversion"]
-    
-    # Create clients
-    for client_id, (X, y) in enumerate(zip(all_features, all_labels)):
-        is_malicious = random.random() < 0.3  # 30% malicious clients
-        attack_type = random.choice(attack_types) if is_malicious else None
-        
-        # Scale features
-        X_scaled = scaler.transform(X) if len(X) > 0 else X
-        
-        clients.append(Client(
-            client_id=client_id,
-            X=X_scaled,
-            y=y,
-            is_malicious=is_malicious,
-            compute_capacity=random.uniform(0.5, 2.0),
-            network_speed=random.uniform(0.5, 2.0),
-            attack_type=attack_type
-        ))
-    
-    return clients, scaler
 
-# =====================
-# BACKDOOR TEST CREATION
-# =====================
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
 
-def create_backdoor_test_data(clients: List[Client], scaler: StandardScaler) -> Tuple[np.ndarray, np.ndarray]:
-    """Create test data with backdoor pattern"""
-    X_test, y_test = [], []
-    pattern = np.zeros(len(clients[0].X[0]))
-    pattern[:3] = 2.0  # Same pattern as in backdoor attack
+def main():
+    """Run comparative experiments with different security configurations."""
     
-    for client in clients:
-        if len(client.X) > 0:
-            split_idx = int(len(client.X) * 0.8)
-            X_clean = client.X[split_idx:]
-            y_clean = client.y[split_idx:]
-            
-            # Create backdoor versions (all samples)
-            X_bd = X_clean + pattern
-            y_bd = np.ones_like(y_clean)  # Target label is 1
-            
-            X_test.append(X_bd)
-            y_test.append(y_bd)
-    
-    if len(X_test) == 0:
-        return None, None
-    
-    return np.vstack(X_test), np.concatenate(y_test)
-
-# =====================
-# MODEL EVALUATION
-# =====================
-
-def evaluate_global_model(server: FederatedLearningServer, test_data: Tuple[np.ndarray, np.ndarray]):
-    """Evaluate global model on test data with shape checks"""
-    X_test, y_test = test_data
-    
-    # Handle case where there are no test samples
-    if len(X_test) == 0 or len(y_test) == 0:
-        print("No test samples available for evaluation")
-        return 0.0
-    
-    # Ensure we have the same number of samples in features and labels
-    min_samples = min(len(X_test), len(y_test))
-    if min_samples == 0:
-        print("No test samples available after filtering")
-        return 0.0
-    
-    # Trim to the same number of samples
-    X_test = X_test[:min_samples]
-    y_test = y_test[:min_samples]
-    
-    n_features = X_test.shape[1]
-    w = server.global_model[:-1]
-    b = server.global_model[-1]
-    
-    predictions = (X_test.dot(w) + b) > 0.5
-    accuracy = np.mean(predictions == y_test)
-    print(f"Global Model Accuracy: {accuracy:.2f}")
-    return accuracy
-
-# =====================
-# MAIN FUNCTION
-# =====================
-
-if __name__ == "__main__":
     # Set random seeds for reproducibility
     np.random.seed(42)
     random.seed(42)
-
-    # Configuration
-    DATA_PATH = Path("multimodal-nback-music-1.0.0")
-    N_FEATURES = 22  # Based on feature extraction function
-
-    # Experiment configurations with attacks
+    torch.manual_seed(42)
+    
+    # Define experiment configurations
     experiments = [
         {
-            "name": "no_defense",
-            "use_dp": False,
-            "use_he": False,
-            "secure_agg": False,
-            "selection_method": "random"
+            "name": "No Defense",
+            "config": FLConfig(
+                num_clients=10,
+                num_rounds=10,
+                use_dp=False,
+                use_homomorphic_encryption=False,
+                use_secure_aggregation=False,
+                selection_method=SelectionMethod.RANDOM,
+                enable_hierarchical_defense=False,
+                malicious_ratio=0.3,
+            )
         },
         {
-            "name": "base_defense",
-            "use_dp": True,
-            "use_he": False,
-            "secure_agg": False,
-            "selection_method": "multi_krum"
+            "name": "Base Defense (Multi-KRUM + DP)",
+            "config": FLConfig(
+                num_clients=10,
+                num_rounds=10,
+                use_dp=True,
+                dp_epsilon=1.0,
+                use_homomorphic_encryption=False,
+                use_secure_aggregation=False,
+                selection_method=SelectionMethod.MULTI_KRUM,
+                enable_hierarchical_defense=True,
+                malicious_ratio=0.3,
+            )
         },
         {
-            "name": "full_defense",
-            "use_dp": True,
-            "use_he": True,
-            "secure_agg": True,
-            "selection_method": "multi_krum"
-        }
+            "name": "Full Defense",
+            "config": FLConfig(
+                num_clients=10,
+                num_rounds=10,
+                use_dp=True,
+                dp_epsilon=1.0,
+                use_homomorphic_encryption=PAILLIER_AVAILABLE,
+                use_secure_aggregation=True,
+                selection_method=SelectionMethod.MULTI_KRUM,
+                enable_hierarchical_defense=True,
+                malicious_ratio=0.3,
+            )
+        },
     ]
-
+    
     results = []
-    attack_metrics = []
-
+    
     for exp in experiments:
-        print(f"\n==== Running Experiment: {exp['name'].upper()} ====")
-
-        # Create clients
-        clients, scaler = create_clients(DATA_PATH, N_FEATURES)
-        print(f"Created {len(clients)} clients for {exp['name']}")
-        print(f"Malicious clients: {sum(1 for c in clients if c.is_malicious)}")
-
-        # Initialize FL server
-        fl_server = FederatedLearningServer(
-            clients=clients,
-            model_shape=(N_FEATURES + 1,),
-            use_dp=exp["use_dp"],
-            use_he=exp["use_he"],
-            scaler=scaler
-        )
+        print(f"\n{'='*60}")
+        print(f"Running: {exp['name']}")
+        print('='*60)
         
-        # Create backdoor test data
-        fl_server.backdoor_test_data = create_backdoor_test_data(clients, scaler)
-        
-        # Set configuration
-        fl_server.config['secure_agg'] = exp["secure_agg"]
-        fl_server.config['selection_method'] = exp["selection_method"]
-        fl_server.config['malicious_ratio'] = 0.4  # Higher for attack scenarios
-
-        # Train for 10 rounds
-        for round_num in range(10):
-            fl_server.train_round()
-            print(f"[{exp['name'].upper()}] Round {round_num + 1} completed")
-            
-            # Track attack metrics every round
-            if fl_server.metrics['attack_success']:
-                attack_metrics.append({
-                    "experiment": exp["name"],
-                    "round": round_num,
-                    "backdoor_success": fl_server.metrics['attack_success'][-1],
-                    "inference_error": fl_server.metrics['inference_error'][-1],
-                    "inversion_error": fl_server.metrics['inversion_error'][-1],
-                })
-
-        # Create test data (last 20% from each client)
-        X_test, y_test = [], []
-        for client in clients:
-            if len(client.X) > 0:  # Ensure client has data
-                split_idx = int(len(client.X) * 0.8)
-                X_test.append(client.X[split_idx:])
-                y_test.append(client.y[split_idx:])
-        
-        if len(X_test) == 0:
-            print("No test data available")
-            accuracy = 0.0
+        # Run experiment (use synthetic if torchvision not available)
+        if TORCHVISION_AVAILABLE:
+            server = run_mnist_experiment(exp['config'])
         else:
-            X_test = np.vstack(X_test)
-            y_test = np.concatenate(y_test)
-            accuracy = evaluate_global_model(fl_server, (X_test, y_test))
+            server = run_synthetic_experiment(exp['config'])
         
-        results.append((exp["name"], accuracy))
-
-        # Visualize metrics
-        fl_server.visualize_metrics(experiment_name=exp["name"])
-        fl_server.visualize_attacks(experiment_name=exp["name"])
-
-    # Final Comparative Results
-    print("\n==== Security Method Comparison Results ====")
-    print("Configuration 1: No Defense (Random selection)")
-    print("Configuration 2: Base Defense (MultiKrum + DP + ATO)")
-    print("Configuration 3: Full Defense (MultiKrum + DP + ATO + HE + SA)\n")
+        # Store results
+        final_accuracy = server.metrics['accuracy'][-1] if server.metrics['accuracy'] else 0
+        results.append({
+            'name': exp['name'],
+            'accuracy': final_accuracy,
+            'server': server
+        })
+        
+        # Visualize
+        server.visualize_metrics(save_path=f"metrics_{exp['name'].replace(' ', '_')}.png")
     
-    for name, acc in results:
-        config_name = name
-        if name == "no_defense":
-            config_name = "No Defense"
-        elif name == "base_defense":
-            config_name = "Base Defense"
-        elif name == "full_defense":
-            config_name = "Full Defense"
-        print(f"{config_name}: Accuracy = {acc:.4f}")
+    # Print comparison
+    print(f"\n{'='*60}")
+    print("EXPERIMENT COMPARISON")
+    print('='*60)
+    for result in results:
+        print(f"{result['name']}: {result['accuracy']*100:.2f}% accuracy")
     
-    # Plot side-by-side accuracy comparison
+    # Create comparison plot
     plt.figure(figsize=(10, 6))
-    names = ["No Defense", "Base Defense", "Full Defense"]
-    accuracies = [acc for _, acc in results]
+    names = [r['name'] for r in results]
+    accuracies = [r['accuracy'] * 100 for r in results]
+    colors = ['red', 'orange', 'green'][:len(results)]
     
-    plt.bar(names, accuracies, color=['red', 'orange', 'green'])
-    plt.title("Security Method Impact on Accuracy")
-    plt.ylabel("Test Accuracy")
-    plt.ylim(0.0, 1.0)
+    bars = plt.bar(names, accuracies, color=colors)
+    plt.title('Security Method Impact on Model Accuracy')
+    plt.ylabel('Accuracy (%)')
+    plt.ylim(0, 100)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Add text labels
-    for i, v in enumerate(accuracies):
-        plt.text(i, v + 0.01, f"{v:.4f}", ha='center')
+    for bar, acc in zip(bars, accuracies):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{acc:.1f}%', ha='center', va='bottom')
     
     plt.tight_layout()
-    plt.savefig('security_comparison.png')
+    plt.savefig('security_comparison.png', dpi=150)
     plt.show()
     
-    # Comparative Attack Analysis
-    if attack_metrics:
-        plt.figure(figsize=(12, 8))
-        
-        # Prepare data
-        attack_df = pd.DataFrame(attack_metrics)
-        avg_metrics = attack_df.groupby('experiment').mean().reset_index()
-        
-        # Map experiment names to readable format
-        name_map = {
-            "no_defense": "No Defense",
-            "base_defense": "Base Defense",
-            "full_defense": "Full Defense"
-        }
-        avg_metrics['experiment'] = avg_metrics['experiment'].map(name_map)
-        
-        # Backdoor success comparison
-        plt.subplot(2, 2, 1)
-        sns.barplot(x='experiment', y='backdoor_success', data=avg_metrics,
-                    order=["No Defense", "Base Defense", "Full Defense"])
-        plt.title('Average Backdoor Success Rate')
-        plt.ylabel('Success Rate')
-        plt.ylim(0, 1)
-        
-        # Inference error comparison
-        plt.subplot(2, 2, 2)
-        sns.barplot(x='experiment', y='inference_error', data=avg_metrics,
-                    order=["No Defense", "Base Defense", "Full Defense"])
-        plt.title('Average Inference Attack Error')
-        plt.ylabel('Reconstruction Error')
-        
-        # Inversion error comparison
-        plt.subplot(2, 2, 3)
-        sns.barplot(x='experiment', y='inversion_error', data=avg_metrics,
-                    order=["No Defense", "Base Defense", "Full Defense"])
-        plt.title('Average Model Inversion Error')
-        plt.ylabel('Reconstruction Error')
-        
-        # Defense effectiveness comparison
-        plt.subplot(2, 2, 4)
-        avg_metrics['defense_effectiveness'] = 1 - avg_metrics['backdoor_success']
-        sns.barplot(x='experiment', y='defense_effectiveness', data=avg_metrics,
-                    order=["No Defense", "Base Defense", "Full Defense"])
-        plt.title('Average Defense Effectiveness')
-        plt.ylabel('Effectiveness (1 - Success Rate)')
-        plt.ylim(0, 1)
-        
-        plt.tight_layout()
-        plt.savefig('attack_comparison.png')
-        plt.show()
+    return results
+
+
+if __name__ == "__main__":
+    main()
