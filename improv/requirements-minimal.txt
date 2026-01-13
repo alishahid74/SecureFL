@@ -1,0 +1,28 @@
+# ============================================================================
+# Secure Federated Learning Framework - Minimal Requirements
+# ============================================================================
+# This file contains only the essential dependencies to run the main framework
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Differential Privacy
+opacus>=1.4.0
+
+# Homomorphic Encryption
+phe>=1.5.0
+
+# Graph Processing
+networkx>=3.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
